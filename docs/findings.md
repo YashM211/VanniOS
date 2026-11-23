@@ -1,0 +1,250 @@
+# Findings
+
+Real-world and test findings, newest first: what happened, why, and what changed.
+Every bug found in a real call also becomes a Hawk regression scenario.
+
+## 2026-10-20 - Voice and audio mode (M3): what real speech recognition does
+Hawk audio mode (Bulbul speaks the simulated caller, Saaras transcribes, Myna answers) found, in
+order of impact:
+- Saaras writes Hinglish in Devanagari and spells English words phonetically ("क्लीनिंग",
+  "फ्राइडे", "चेकअप", "कैंसिल"), so rules-based Myna misread bookings, cancels and (in principle)
+  emergencies. Fixed in the rule vocabulary, including emergency/medicine/staff/opt-out phrases.
+  The safety lists matter most: "चेस्ट पेन" must trigger 112 exactly like "chest pain".
+- Numbers arrive as words ("eleven a.m.", "twelve thirty p.m."); time parsing now converts them.
+- Names get mangled ("Neha" -> "Deha", "Asha" -> "काशा"). The read-back catches it only if the
+  caller listens, so a spoken correction at the read-back ("no, the name is X") is now accepted.
+- Saaras sometimes switches script or even language mid-call (a "haan ji" came back in Gurmukhi;
+  one Hindi sentence came back translated into English). Myna re-asks and hands off after two
+  misses, which is the safe behaviour; pinning the STT language per call is a follow-up.
+- Doc vs API: Sarvam's production guide says TTS min_buffer_size 15-25; the API rejects < 30.
+- Real model, 24-call audio sample: 79% pass (reminders SAFE, booking/messages not yet). Text-only
+  Hawk is 100%, so audio is where the remaining risk is. Reports: run-06 (rules), run-07 (Sarvam).
+- Open: the live WebRTC test passes alone but intermittently gets no microphone audio when run in
+  the same pytest session as the other live voice test, in either order. Live tests are therefore
+  opt-in and run one file at a time. Not yet known whether this is test isolation or a real
+  second-call-in-one-process problem; check this before the pilot.
+
+## 2026-10-20 — Scaling out: Hawk with two agent instances (run 05)
+`pnpm hawk run --instances 2` starts two agents sharing one Redis and sends every turn of every
+call to the *other* instance than the previous turn. 106/106 pass, so a call's state genuinely
+lives in the store, not in any process. What the exercise surfaced before it ever ran in prod:
+- Each API instance kept the kill switch in memory: toggling it on one left the others taking
+  calls. Fixed with the config bus (see decisions.md) and a two-instance test.
+- A naive "wrap the Redis lock in try/except and fall back" would have run the locked turn twice
+  if the turn itself raised. The fallback now wraps acquiring the lock only.
+- The reminder list had no owner: two workers asking at once would both have dialled the same
+  patient. Now claimed atomically (20 racing claimers, exactly one winner).
+
+## 2026-10-20 — Hawk against the REAL model (Sarvam `sarvam-105b-conversations`)
+Reports: `docs/reports/run-03-live-first-attempt.html` → `run-04-live-final.html`.
+
+The offline suite was 100% on all three flows, so I expected the real model to roughly match.
+**It scored 26% on the Hinglish suite** (9/34; booking 29%, messages 0%, reminders 38%). One
+critical failure: a booking nobody asked for. The offline tests had never shown any of this,
+because a language model fails in ways a keyword parser doesn't. After the fixes below:
+**102/103 (99%), all three flows SAFE TO LAUNCH**, 370 model calls with 1 fallback to rules,
+p50 372 ms / p95 1.98 s per reply (understanding only; speech comes with M3).
+
+The principle that fixed all of it: **the model suggests, code decides.** Wherever the answer is a
+closed set or a visible fact (a service name, a doctor, yes/no/goodbye, Devanagari = Hindi, a
+message category), deterministic code overrules a noisy model. The model keeps the judgement calls
+(intent, emergencies, medical questions, frustration) and code never overrides what it did extract.
+
+| # | What the live model did | Effect on a call | Fix (each one is a regression test) |
+|---|---|---|---|
+| 1 | Right intent, but left `service_id` empty, even for the bare answer "cleaning" | Myna asked "what is the visit for?" 16 times | Code fills fields the model left empty (service, doctor, option, phone, DOB, name, FAQ). |
+| 2 | Copied a date from an earlier turn into `date_text` on a bare "Haan ji" | Wiped the slot being confirmed; an `assert` then crashed the turn (HTTP 500) | A model hint only counts if it quotes what the caller just said. No asserts in commit paths. Any unexpected error becomes a handoff, never a dead line. |
+| 3 | Heard "yes" (or a new FAQ) in "Nahi, bas. Thank you." | Myna asked what to book next; the caller started over and booked twice (the critical failure) | On yes/no/goodbye questions, plain keywords beat a confused or wrong model. |
+| 4 | Collapsed "is my report ready? also book a cleaning" into one label | The booking was dropped | Code sees the booking word plus a day or service: book first, the question waits its turn. |
+| 5 | Labelled Devanagari "hinglish", and "Nahi, bas. Thank you." "en" | Hindi callers got Hinglish replies | Script is a fact: Devanagari is Hindi. Hinglish words veto a switch to English. |
+| 6 | Filed "is my X-ray report ready?" and "ask the doctor to call me" as `other`; called a bill question an FAQ | Wrong task category; a bill question was transferred ("I don't have that information") instead of taken as a message | Closed-vocabulary categories are decided by keywords when the model says nothing specific; a report/refill/bill/callback request is never an FAQ. |
+| 7 | Sarvam's Starter plan rate-limits (~40–60 chat requests/min) | 429s silently downgraded a call to the keyword parser, and one call hung past 20 s | Retry with backoff; a hard 6 s model budget (a phone caller can't wait); `/v1/stats` counts model answers vs fallbacks and Hawk prints it, so a report can't claim the model's result for the parser's work. |
+
+Also learned:
+- `sarvam-105b` is a *reasoning* model: given a small token budget it can spend it all thinking and
+  return an empty reply. `sarvam-105b-conversations` answers directly (~300 ms) and is the right
+  model for a voice agent; it is now the default.
+- Hawk now prints the agent's log tail when a call errors. That is how finding #2's traceback was found.
+- Still open: the Hawk patients are scripted and text-only. Re-run with LLM-played patients and in
+  audio mode (M3) before trusting any SAFE verdict for a pilot.
+
+## 2026-10-03 — Hawk run 1: the first go-live report (M2)
+103 simulated calls (35 scenarios × EN / Hinglish / Hindi), rule-based understanding, scripted
+patients. Report: `docs/reports/run-01-baseline.html`.
+
+**Verdict: NOT SAFE on all three flows.** Booking 71%, messages 80%, reminders 80%;
+English 94%, Hindi 76%, **Hinglish 53%**. Four critical failures.
+
+| # | Severity | What Hawk found | Why | Fix |
+|---|---|---|---|---|
+| 1 | critical | Hindi callers could never reschedule or cancel; Hindi messages were filed "unverified". | Speech-to-text gives "राहुल गुप्ता"; the record says "Rahul Gupta". Verification compared them literally. | API name matching transliterates Devanagari and compares consonant skeletons ("Pooja"/"Puja"/"पूजा" → `pj`). DOB/phone still must match exactly. |
+| 2 | critical | A Hindi "don't call me again" on a reminder call was not understood; the number was never opted out. | The Hindi full stop "।" is inside the Devanagari Unicode block, so "करो।" never ended a word and phrase matching failed. | `normalize()` turns ।/॥ into spaces. Affected every Hindi phrase at a sentence end, not just opt-outs. |
+| 3 | high | Callers who say their date of birth in words ("twelve April nineteen ninety", "baarah April unnees sau nabbe") were handed to staff after two tries. | The date parser only read digits. | `numbers.py` turns English, romanised-Hindi and Devanagari number words into digits, incl. "unnees sau nabbe" and "do hazaar paanch". |
+| 4 | low | Half of Hinglish calls got some English replies. | (a) "Staff se baat karni hai." tokenised as "hai." so the Hinglish marker didn't match; (b) a date of birth ("15 March 1992") looked like 3 English words and switched the call to English. | Word tokens for language detection; switching to English now needs English function words, not just Latin script. |
+| 5 | medium | "How much is a consultation?" wasn't recognised as a fees question. | Missing phrase. | Added "how much" / "kitni hai" / "कितना लगेगा". |
+| 6 | high | A Hindi "please ask Dr. Mehta to call me" message was filed as "other". | Missing Hindi callback phrases. | Added. |
+
+**Run 2, after the fixes: SAFE TO LAUNCH on all three flows, 100% in every language**
+(`docs/reports/run-02-after-fixes.html`). Read that with the caveat printed on the report:
+scripted patients phrase things the way the scenarios were written, so the suite now proves the
+agent handles *these* phrasings in all three languages, not that it is ready for real callers.
+The next honest verdict needs LLM-played patients (needs a Sarvam key) and audio mode (M3).
+
+Also found while building Hawk (not agent bugs):
+- The grader first called "the appointment was left unchanged" critical. It isn't a wrong
+  action, it's a goal not met, so it's high now. Critical is reserved for bookings nobody asked for.
+- On Windows, stopping `uv run` orphans the Python server it started. Hawk kills process trees.
+
+## 2026-10-03 — M1 end-to-end conversations (rule-based NLU, synthetic patients)
+Found by the first 20 scripted conversations against the real API. Each is now a regression test,
+and each should become a Hawk scenario in M2.
+
+| # | What happened | Why | Fix |
+|---|---|---|---|
+| 1 | Hinglish caller said "Pooja Malhotra"; Myna switched to English for the rest of the call. | Language was re-detected on every turn; a bare name has no Hindi words. | Short Latin-script answers (<3 words) don't switch language. |
+| 2 | Patient "Kiran Rao" was booked with Dr. Rao. | Doctor names were matched anywhere, including inside the caller's own name. | Doctor/service mentions are ignored while Myna is collecting identity. |
+| 3 | "Do you take cashless insurance?" was answered in Hinglish. | "do" (Hindi "give") was a Hinglish marker; it's also English. | Removed ambiguous markers. |
+| 4 | "No, make it Friday at 12" kept 11 am. | A bare number wasn't treated as a time. | "at/around/by N" is a time; a lone number still isn't. |
+| 5 | Two simultaneous bookings for one slot: the loser got a raw `SQLITE_BUSY` error. | libsql transactions don't inherit `busy_timeout`. | In-process write queue; loser now gets `SLOT_UNAVAILABLE` and is re-offered times. |
+| 6 | Offering three slots on one day read the date three times. | Each option was read as date + time. | Same-day offers say the date once. |
+
+Open questions for Hawk (M2):
+- **"kal"** means both yesterday and tomorrow; we always read it as tomorrow in a booking context.
+  Check real calls for "kal aaya tha" (I came yesterday) in reschedule flows.
+- **"next Tuesday" on a Monday** resolves to the Tuesday of next calendar week (8 days away),
+  not tomorrow. Callers split on this; the read-back with the absolute date is our safety net.
+  Measure how often callers correct it.
+- ~~**Name matching is strict**~~ — confirmed by Hawk run 1 (Hindi names) and fixed, see above.
+
+## 2026-10-27 — first real-microphone test (browser voice)
+
+- Mic reached the agent but at peak level 1-10 of 32767: Windows input volume was low and Chrome
+  may have picked another device. Fix on the user side (volume 100, correct device). Added a
+  per-5-second caller-audio peak log and VAD/transcript log lines so this is diagnosable next time.
+- Saaras returned a spoken phone number as English words ("Eight seven eight seven ..."), which the
+  phone regex missed, so Myna asked for the number twice and then handed off. `parse_phone` now
+  accepts digits spoken one by one (English and Hinglish words). Regression test added.
+
+## 2026-10-27 — deep scan of realistic conversations (rules NLU, ASR-style transcripts)
+
+Why a caller turn looked "half Hindi, half English": Saaras `transcribe` writes Hindi words in
+Devanagari and English words in Latin, so one sentence is two scripts ("मुझे कल शाम को clean का
+appointment चाहिए"). `codemix` does the same; `verbatim` spells English in Devanagari ("ट्वेल्व
+मार्च"). `translit` writes everything in Roman ("Mujhe kal shaam ko clean ka appointment chahiye",
+"12 March 1985"). The voice pipeline now defaults to `translit` (`VOICE_STT_MODE` to change it).
+Two further sources remain: Myna's own Hinglish templates mix Roman Hindi with English words on
+purpose, and FAQ answers come from the clinic config in English only.
+
+Fixed (each has a test):
+- "hmm", "uh", "hello?" counted as failed understanding and handed the call to staff after two.
+  They are now noise (own streak, handoff after 4); "one minute / ruko" and "sorry what / dobara
+  bolo / bolo" are a hold and a repeat, never a failure.
+- "root canal ka kitna kharcha aayega" was treated as a booking (service word) instead of a fees
+  question; Hindi price words added ("kharcha", "rate", "kitna aayega").
+- A patient called Mehta was matched to Dr. Mehta (surname = doctor name) while giving their name.
+- Spoken zero ("shunya", "shoonya", "sifar"), "double nine" / "triple five" in phone numbers.
+
+Known, not fixed (candidates for Hawk scenarios):
+- Information volunteered out of order is dropped when the question is something else (a name
+  given while Myna asks for the service is not kept; broadening it risks "I am fine" as a name).
+- Third-party callers ("meri mummy ke liye ... unki last appointment batao") end in a vague
+  handoff instead of explaining that the patient's own name and date of birth are needed.
+- FAQ answers are English-only in the clinic config, so a Hindi/Hinglish call gets one English line.
+- "Dr. X" spoken without a title, and "evening 5" (part of day + hour) lose the hour.
+- Frustration words end the call in a handoff on the first sighting (by design, rule 5).
+
+## 2026-11-06 — audio-mode Hawk, runs 06-09
+
+Rule-based understanding, 24 spoken calls per run (Bulbul → Saaras), 60% → 80% → 87% → 96% as each
+cause was fixed. Real causes: (1) the harness used Saaras `transcribe`, which writes Hindi in
+Devanagari and sometimes detects Punjabi ("Haan ji" → "ਹਾਂਜੀ"); the live voice uses `translit`, so
+the harness now does too. (2) A short English phrase ("thank you") flipped a Hindi call to English.
+(3) "Patient's name X" was stored with "Patient's Name" as part of the name (critical). (4) "Guruvaar"
+(long vowel) was not a weekday, so a reschedule was moved to today. (5) "Clinic ka samay kya hai"
+was not a timings question. Not agent bugs: "Verma" heard as "Vama" leaves a message unverified
+(correct, strict), "galat number" heard as "Gallup number". Not yet measured: the real model in
+audio mode, and variance between runs of the same sample.
+
+
+## 2026-11-06 — Audio-mode Hawk on the restaurant vertical (runs 12 and 13)
+
+24 spoken calls each (Bulbul to Saaras `translit`, rules understanding, scripted guests). Both runs
+read NOT SAFE (83%, 15/18 booking) because of critical flags; none was a disclosure. Details:
+- **Agent bug, fixed:** after a phone number said in words ("nau aath do do do shoonya...") Myna
+  switched a Hinglish call to English, because "do" looks like an English word. A turn that is
+  mostly number words now says nothing about language (`mostly_number_words`); "nav" also reads
+  as nine. Run 13 no longer shows it.
+- **ASR, not agent:** "Rhea" heard as "Riya" booked the table under the wrong name (the guest never
+  spelled it); "9000000099" came back as nine digits, so Myna handed over for "repeated
+  misunderstanding" instead of "verification failed" (safe, nothing disclosed, but the grader
+  expects the stricter reason); "Thursday" came back as "Karsade", so a reschedule offered Monday
+  (the read-back said "from Tuesday to Monday" and the scripted guest said yes; a real caller
+  would object).
+- **Takeaways:** names and long digit strings are where speech recognition hurts a booking. Ideas,
+  not built: spell back unusual names, read a phone number back in pairs, and ask "which day?"
+  when a reply has a time but no recognisable day. Different failures appeared in each run (the
+  recogniser is not deterministic), so a 24-call sample is a smoke test, not a verdict.
+- Still not run: the real model (`--nlu sarvam`) in audio mode.
+
+**Follow-up, same day (built):** a reply with a time but no day ("make it 9 pm") no longer searches
+the whole week for the earliest match; Myna asks which day and keeps the time (booking and
+reschedule). Scripted Hawk run 14: 145/145, all three flows SAFE; the audio sample has not been
+re-run since. Name spell-back and phone read-back in pairs were not built: the read-back already
+says the name, and a short phone number is already rejected.
+
+## 2026-11-06 — Real model in audio mode, restaurant (run 15)
+
+24 spoken calls with the Sarvam model understanding the caller (94 model calls, 0 fallbacks,
+0 retries). Booking 15/18, messages 6/6, same three critical flags as the rules runs, all from
+speech recognition, none from the agent's logic: "Rhea" heard as "Riya" and "Sayyed" as "Said"
+(the table is booked under the heard name, and the caller's own correction is heard the same
+way again), and "9000000099" lost zeros so Myna handed over after two tries
+(`repeated_misunderstanding`, nothing disclosed). The agent never had a wrong day or a
+language flip this time. Conclusion: with the model or without, the weak spot is names and
+long digit strings in speech; the open decision is whether a restaurant needs a spelled-out
+name (probably not: the staff see the booking and the phone number) and whether a clinic does
+(yes: verification depends on it, and it already fails closed to staff).
+Not yet run in audio mode: the clinic vertical with the real model.
+
+## 2026-11-06 — Real model in audio mode, clinic (run 16)
+
+24 spoken calls (new `--vertical clinic|restaurant` flag on `hawk run`), Sarvam model
+understanding, 93 model calls, 0 fallbacks: 24/24 passed, booking 15/15, messages 4/4,
+reminders 5/5. The clinic sample did not hit a name or digit mis-hearing this time; run 15 shows
+the restaurant sample did, so one 24-call sample per vertical is a smoke test, not a rate
+(the recogniser is not deterministic and the sample is small). Both verticals now have a spoken,
+real-model run on record.
+
+## 2026-11-06 — Vertical leakage audit, and what the real model showed (runs 17 to 22)
+
+Prompted by a manual call: a restaurant chat asked for a "patient's date of birth". Looked at every
+place a business's words can reach a caller or the model:
+- **Caller-facing templates:** message-taking asked a restaurant guest for a patient's date of
+  birth (`ask_dob_message`), and the emergency line said "clinic staff". Fixed; every line now
+  resolves per vertical (`i18n.VERTICAL_LINES`).
+- **The prompt the model reads:** it said "a dental clinic", "the patient's name", "Doctors" for a
+  restaurant. Now a per-vertical vocabulary (`_VOCAB` in `llm/sarvam.py`).
+- **The output schema the model reads:** field descriptions ("patient's full name") and the task
+  categories (`medicine_refill_request`) went to restaurant calls too. Now rewritten per vertical.
+- **Guards, so it cannot come back:** `tests/test_vertical_leakage.py` (every template in 3
+  languages, the prompt, the schema, 12 call journeys, and a registry test that fails if a new
+  vertical lacks wording or a forbidden-word list) and a critical Hawk check `vertical_wording`
+  on every agent turn. Checklist for a hotel in `docs/plan-generalise.md`.
+- **Not fixed:** staff task category labels in the dashboard (`CATEGORY_LABEL`) still say
+  "Doctor call-back", "Medicine refill".
+
+Real model, text mode, first time on the restaurant vertical (run 20): 34/39. Three real bugs that
+the scripted (rules) runs had hidden, all fixed:
+- "हाँ जी" at the waitlist offer came back as `provide_info`, so Myna looped and then handed over.
+  This is the same bug a manual call hit ("haan daal do"). A very short plain yes/no now beats a
+  confused model label (never over emergency, medical, opt-out, wrong number, human), and never
+  when the reply carries a day, time or number. The waitlist question was also missing from the
+  closed-question list.
+- "नहीं, बस। धन्यवाद।" at "anything else?" came back as a new reschedule, which moved the booking
+  a second time. Same fix.
+- A phone number said as digits only ("90000 00099") flipped the call's language. Fixed.
+After the fixes: restaurant 37/39 (run 21), clinic 105/106 (run 22, 383 model calls, 12 fell back
+to rules). The remaining misses are one flow: after a failed name + phone (or date of birth) check,
+Myna asks for the details again; if the caller answers with the name only, the real model does not
+extract it, Myna says "samajh nahi paayi" twice and hands over. Safe (nothing disclosed) but wrong
+reason and poor experience. Not fixed.

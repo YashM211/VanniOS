@@ -1,0 +1,7 @@
+packages:
+  - apps/*
+  - services/api
+  - hawk
+  - packages/*
+allowBuilds:
+  esbuild: true

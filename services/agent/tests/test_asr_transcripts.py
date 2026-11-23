@@ -1,0 +1,220 @@
+"""Real speech-recognition output (Saaras v4 via Hawk audio mode, 2026-10-20) must be understood.
+
+Saaras writes Hinglish in Devanagari, spells English words phonetically ("क्लीनिंग", "फ्राइडे"),
+and sometimes switches script mid-call. These strings are what the recogniser actually returned.
+"""
+
+from __future__ import annotations
+
+from datetime import date
+
+import pytest
+
+from myna_agent.dates import parse_date, parse_time
+from myna_agent.nlu import ClinicFacts, Intent, RuleBasedNLU, TurnContext, parse_phone
+from myna_agent.safety import check
+
+TODAY = date(2026, 10, 12)  # a Monday
+FACTS = ClinicFacts(
+    services={
+        "cleaning": ["cleaning"],
+        "consultation": ["consultation", "checkup"],
+        "filling": ["filling"],
+        "root-canal": ["root canal"],
+    },
+    resources={"dr-mehta": ["dr. mehta", "mehta"]},
+    faqs={},
+)
+
+
+def ctx(expecting: str) -> TurnContext:
+    return TurnContext(expecting=expecting, today=TODAY, facts=FACTS, language="hinglish")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("heard", "service"),
+    [
+        ("मुझे क्लीनिंग का अपॉइंटमेंट चाहिए कल दोपहर 12 बजे", "cleaning"),
+        ("मुझे चेकअप का अपॉइंटमेंट चाहिए फ्राइडे दोपहर 12 बजे", "consultation"),
+        ("मुझे सफाई का अपॉइंटमेंट चाहिए कल सुबह 11:00 बजे", "cleaning"),
+    ],
+)
+def test_services_spelled_the_way_saaras_writes_them(heard: str, service: str) -> None:
+    u = RuleBasedNLU().parse(heard, ctx("intent"))
+    assert u.service_id == service
+    assert u.intent == Intent.book
+
+
+@pytest.mark.parametrize(
+    ("heard", "expected"),
+    [
+        ("फ्राइडे", date(2026, 10, 16)),
+        ("थर्सडे शाम को", date(2026, 10, 15)),
+        ("मंडे", date(2026, 10, 19)),
+        ("संडे", date(2026, 10, 18)),
+    ],
+)
+def test_english_weekdays_in_devanagari(heard: str, expected: date) -> None:
+    ref = parse_date(heard, TODAY)
+    assert ref is not None and ref.start == expected
+
+
+def test_eleven_oclock_with_minutes_in_devanagari_speech() -> None:
+    t = parse_time("कल सुबह 11:00 बजे")
+    assert t is not None and t.as_hhmm() == "11:00"
+
+
+@pytest.mark.parametrize("heard", ["नाही बस थँक्यू", "नहीं, बस धन्यवाद।", "No, bas. Thank you."])
+def test_goodbyes_as_recognised(heard: str) -> None:
+    assert RuleBasedNLU().parse(heard, ctx("anything_else")).intent in (Intent.goodbye, Intent.no)
+
+
+# ---- Safety rules must hold when English words arrive in Devanagari (Saaras' habit).
+
+
+@pytest.mark.parametrize(
+    "heard",
+    [
+        "मेरी मम्मी को चेस्ट पेन हो रहा है",
+        "पापा को हार्ट अटैक आया है",
+        "बहुत ब्लीडिंग हो रही है",
+        "ब्लीडिंग रुक नहीं रही",
+        "एक्सीडेंट हो गया है",
+        "वो अनकॉन्शियस हो गए हैं",
+        "मुझे सुसाइड के ख्याल आ रहे हैं",
+    ],
+)
+def test_emergencies_are_caught_in_transliterated_speech(heard: str) -> None:
+    assert check(heard).emergency is not None
+
+
+def test_ordinary_dental_bleeding_is_not_an_emergency() -> None:
+    assert check("मसूड़ों से ब्लीडिंग होती है, चेकअप चाहिए").emergency is None
+
+
+@pytest.mark.parametrize("heard", ["कौन सी मेडिसिन लूं", "पैरासिटामोल ले सकता हूँ क्या", "डोज़ कितनी है"])
+def test_medicine_questions_are_still_refused(heard: str) -> None:
+    assert check(heard).medical is not None
+
+
+def test_refills_and_staff_requests_and_opt_outs() -> None:
+    assert check("मुझे रीफिल चाहिए").refill is not None
+    assert check("मुझे स्टाफ से बात करनी है").wants_human is not None
+    assert check("मुझे रिसेप्शनिस्ट से बात करनी है").wants_human is not None
+    assert check("दोबारा कॉल मत करना").opt_out is not None
+
+
+@pytest.mark.parametrize(
+    ("heard", "intent"),
+    [
+        ("कैंसिल कर दो।", Intent.cancel),
+        ("मुझे अपॉइंटमेंट रीशेड्यूल करना है", Intent.reschedule),
+        ("मेरा अपॉइंटमेंट चेंज करना है", Intent.reschedule),
+    ],
+)
+def test_change_and_cancel_in_transliterated_speech(heard: str, intent: Intent) -> None:
+    assert RuleBasedNLU().parse(heard, ctx("intent")).intent == intent
+
+
+@pytest.mark.parametrize(
+    ("heard", "hhmm"),
+    [
+        ("tomorrow at eleven a.m.", "11:00"),
+        ("ten a.m. please", "10:00"),
+        ("two p.m.", "14:00"),
+        ("twelve thirty p.m.", "12:30"),
+        ("half past two in the afternoon", "14:30"),
+        ("quarter past ten", "10:15"),
+        ("quarter to eleven", "10:45"),
+        ("at 11 a.m.", "11:00"),
+        ("eleven o'clock", "11:00"),
+    ],
+)
+def test_english_times_the_way_they_are_transcribed(heard: str, hhmm: str) -> None:
+    t = parse_time(heard)
+    assert t is not None and t.as_hhmm() == hhmm
+
+
+@pytest.mark.parametrize(
+    ("heard", "phone"),
+    [
+        ("Eight seven eight seven two eight five six one six.", "8787285616"),
+        ("mera number 98765 43210 hai", "9876543210"),
+        ("plus nine one nine eight seven six five four three two one zero", "9876543210"),
+        ("aath saat aath saat do aath paanch chhe ek chhe", "8787285616"),
+        ("my date of birth is 12 03 1990", None),
+    ],
+)
+def test_phone_numbers_said_digit_by_digit(heard: str, phone: str | None) -> None:
+    """Saaras returns spoken digits as English words; the booking must still get the number."""
+    assert parse_phone(heard) == phone
+
+
+def test_patient_sharing_a_doctors_surname_is_not_asking_for_that_doctor() -> None:
+    """ "Rohan Mehta" answers "what is the name?"; it does not pick Dr. Mehta."""
+    surname = next(n for names in FACTS.resources.values() for n in names).split()[-1]
+    u = RuleBasedNLU().parse(f"Rohan {surname.capitalize()}", ctx("name"))
+    assert u.name is not None and u.resource_id is None
+    # ...but "Dr. Mehta" still does.
+    assert RuleBasedNLU().parse(f"I want to see Dr {surname}", ctx("when")).resource_id is not None
+
+
+@pytest.mark.parametrize(
+    ("heard", "name"),
+    [
+        ("Patient's name Kamala Devi", "Kamala Devi"),
+        ("patient name Rohan Mehta", "Rohan Mehta"),
+        ("name Neha Kapoor", "Neha Kapoor"),
+        ("Patient's name is Neha Kapoor", "Neha Kapoor"),
+    ],
+)
+def test_patient_name_written_the_way_saaras_writes_it(heard: str, name: str) -> None:
+    """Run 06 stored "Patient's Name Kamala Devi" as the patient's name."""
+    assert RuleBasedNLU().parse(heard, ctx("name")).name == name
+
+
+@pytest.mark.parametrize(
+    ("heard", "expected"),
+    [
+        ("Guruvaar dopahar 12:00 baje", date(2026, 10, 15)),
+        ("shukravaar subah", date(2026, 10, 16)),
+        ("mangalwaar 5 baje", date(2026, 10, 13)),
+        ("ravivaar ko", date(2026, 10, 18)),
+    ],
+)
+def test_weekdays_spelled_with_a_long_vowel(heard: str, expected: date) -> None:
+    """Run 08: "Guruvaar" was not a weekday, so Myna offered today and moved the booking there."""
+    ref = parse_date(heard, TODAY)
+    assert ref is not None and ref.start == expected
+
+
+@pytest.mark.parametrize(
+    "heard", ["Clinic ka samay kya hai", "clinic kitne baje khulta hai", "kab tak khula rehta hai"]
+)
+def test_clinic_timings_asked_in_roman_hindi(heard: str) -> None:
+    facts = ClinicFacts(
+        services=FACTS.services,
+        resources=FACTS.resources,
+        faqs={"timings": "What are the clinic timings?"},
+    )
+    context = TurnContext(expecting="intent", today=TODAY, facts=facts, language="hinglish")
+    u = RuleBasedNLU().parse(heard, context)
+    assert u.intent == Intent.faq and u.faq_id == "timings"
+
+
+@pytest.mark.parametrize(
+    "heard",
+    [
+        "Nau aath do do do shoonya shoonya teen shoonya do",
+        "nine eight two two two zero zero three zero two",
+        "nav aath do do do shoonya shoonya teen shoonya do",
+        "90000 00099",
+        "9822200301",
+    ],
+)
+def test_a_phone_number_said_in_words_is_not_a_language(heard: str) -> None:
+    from myna_agent.numbers import mostly_number_words
+
+    assert mostly_number_words(heard)
+    assert not mostly_number_words("Is your paneer dish safe with a nut allergy")
+    assert not mostly_number_words("I would like two tables please")

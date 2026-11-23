@@ -1,0 +1,221 @@
+# Decisions
+
+Newest first. Each entry: what, why, and what would make us revisit it.
+
+## 2026-10-20 — Redis: four uses, each with a failure it prevents
+Approved plan: `docs/plan-redis.md`. Redis is optional (no `REDIS_URL` = in-memory, same
+interfaces, same tests). Versions: redis-py 8.1, ioredis 6, Redis 7 in CI/compose.
+- **Live-call state** (agent): the whole conversation serialises to a versioned JSON snapshot
+  under `myna:call:{id}` with a 30-min sliding TTL. Every turn runs load → handle → save under a
+  per-call lock (`SET NX PX` + compare-and-delete release), so any instance serves any turn, a
+  deploy doesn't drop calls, and a double-tapped send can't interleave. The snapshot has a
+  version; an incompatible one answers 410 "please start again" rather than crashing. The clinic
+  config and model client are deliberately NOT in the snapshot (rebuilt per instance).
+- **Reminder claims** (API): `POST /reminders/claim` hands a worker the due reminder only if
+  `SET NX PX 120000` succeeds. The claim expires, so a crashed worker's reminder returns. If
+  Redis is unreachable the answer is "claimed nothing": a missed reminder beats ringing a
+  patient twice.
+- **Shared rate limits** (API login lock-out, web demo chat): atomic `INCR`+`PEXPIRE` in one Lua
+  script, fixed window. Falls back to per-instance memory if Redis is down (a limiter must not
+  take the site down). One implementation in `@myna/shared/rate-limit`, used by API and web.
+- **Config cache + kill switch**: the agent caches a clinic's config for 60 s, but a config with
+  the kill switch ON is never cached or served from cache. The API `DEL`s the key and publishes
+  on `myna:config-changed` when settings change; every API instance subscribes and re-reads that
+  clinic from the DB. (This also fixed a real scale-out bug: each API instance held the kill
+  switch in its own memory, so flipping it on one instance left the others taking calls.)
+- Per-tenant key prefixes were dropped for call state: call ids are random UUIDs and the turn
+  route doesn't know the clinic, so the clinic id lives inside the snapshot instead.
+- Tests: the same store/limiter/claim contract suites run on memory, a Redis mock/fakeredis,
+  and (when `REDIS_URL` is set, as in CI) a real Redis. Locally there is no Docker daemon, so
+  `hawk run --instances 2` starts a Redis-protocol server (fakeredis' TCP server) unless
+  `REDIS_URL` points at a real one; CI runs it against real Redis 7.
+
+## 2026-10-03 — Hawk: how a call is judged
+- **One throwaway tenant per scenario** (`/v1/hawk/*`, only with `HAWK_ENABLED=1`, refused in
+  production). Uses the product's own tenant isolation, so scenarios run in parallel with no DB
+  resets, and the grader reads the tenant's complete end state.
+- **Scenarios are language-neutral goals**; the scripted patient renders them in EN / Hinglish /
+  Hindi and a persona's style. One scenario = three calls, no hand-translated scripts to drift.
+- **Deterministic checks only; severities decide the verdict.** Critical = a safety-rule miss or a
+  wrong action the caller would act on; high = goal not met; medium = met clumsily (needless
+  handoff); low = polish. SAFE TO LAUNCH ≥ 92% and no critical; LAUNCH WITH HANDOFF ≥ 80%, no
+  critical, every failure ended with a person; else NOT SAFE.
+- **The LLM judge (politeness, clarity) is reported as "not graded"** without a model key, rather
+  than faked with heuristics.
+- **The scripted patient is a known weakness**: it says things the way scenarios were written.
+  The report prints that caveat. LLM-played patients are the next step once a key is available.
+- **Replies expose `expecting`** (what Myna is waiting for). The scripted patient uses it; an
+  LLM patient won't need it. Revisit if it ever tempts the agent's design.
+
+## 2026-10-03 — Phonetic name matching for verification
+Names are compared as order-insensitive consonant skeletons after transliterating Devanagari
+("Pooja Malhotra" = "Puja Malhotra" = "पूजा मल्होत्रा"). It is deliberately lossy; it is safe
+because verification still needs an exact date of birth or registered phone, and the candidates
+are only the few patients sharing that phone or DOB. Found necessary by Hawk run 1.
+
+## 2026-10-03 — Flow (b) and (c) choices
+- **Unverified callers still get their message taken** (your call, M2 plan): flagged unverified,
+  linked to no patient, nothing disclosed. "Please ask the doctor to call me" shouldn't need a DOB.
+- **Callback promises count opening hours** (9 pm + 2 h = noon next day); the API computes it so
+  the agent never does date maths for promises.
+- **Reminder identity check = confirmed name + full date of birth**, checked by the API. A family
+  member gets a call-back request with no details.
+- **Do-not-call is keyed by phone number**, in Myna's own table: opt-outs apply to the number we
+  dial (family phones included) and work with any scheduling backend.
+- **Reminders are off unless the clinic enables them**, the call window must end by 19:00, and the
+  kill switch also stops them.
+- **Reminder calls speak the clinic's greeting language** for now. A per-patient preferred
+  language is the obvious next field once real clinics tell us how they record it.
+
+## 2026-10-03 — The model understands; code speaks
+The LLM's only job is to fill an `Understanding` (intent, language, extracted fields,
+confidence). Every reply Myna says is a fixed template per language (`i18n.py`), chosen and
+filled by the state machine. Consequences: the model cannot give medical advice, invent a fee,
+or read out details before verification, even if prompted to. Replies sound templated; Hawk's
+soft-criteria judge will tell us whether that costs us with callers. Revisit only with a
+judge-graded reason, and even then let the model rephrase a chosen template, never free-write.
+
+## 2026-10-03 — Code parses dates; the model only points at them
+`dates.py` resolves days and times (Hinglish ordinals, saade/sawa/paune, "agle hafte",
+mind changes = last mention). The model copies the caller's words into `date_text`/`time_text`;
+code parses those only if parsing the raw utterance failed. Dates are where agents fail, and a
+tested parser fails the same way every time, which Hawk can measure and we can fix.
+
+## 2026-10-03 — Rule-based NLU stays, as offline mode, fallback and baseline
+`RuleBasedNLU` (keywords + patterns) runs the agent with no API key, makes the e2e tests
+deterministic, and catches Sarvam outages (`WithFallback`). It is also the baseline Hawk compares
+the LLM against: if Sarvam doesn't beat rules on a scenario type, that's a finding.
+
+## 2026-10-03 — Sarvam model: `sarvam-105b`, not `sarvam-30b`
+The spec says sarvam-30b, but Sarvam's docs now list it as deprecated. Chat completions:
+`POST https://api.sarvam.ai/v1/chat/completions`, header `api-subscription-key`,
+`response_format: json_schema`, `reasoning_effort: low` (for latency). Configurable via
+`SARVAM_MODEL`; `sarvam-105b-conversations` (32K context) is worth a latency test in M3.
+
+## 2026-10-03 — Language follows the caller, but not on short answers
+Myna replies in the caller's language each turn, except that a short Latin-script answer
+(a name, "yes", fewer than 3 words) does not switch a Hinglish call to English. Found by the
+e2e tests (see findings).
+
+## 2026-10-03 — SQLite writes are queued in-process
+libsql opens a fresh connection per transaction, which doesn't inherit `busy_timeout`, so
+concurrent bookings got raw `SQLITE_BUSY` instead of a typed `SLOT_UNAVAILABLE`. Writes now go
+through `writeTransaction` (one in-process queue + short retry for other processes). Data was
+never at risk (a partial unique index backs up the overlap check). Postgres won't need the queue.
+
+## 2026-10-03 — Pinned clock for reproducible runs
+The API honours `MYNA_FAKE_NOW` (refused when `NODE_ENV=production`); the agent takes a `now`
+function. Tests use Monday 12 Oct 2026, 09:00 IST, so slot offers are identical every run.
+Hawk will use the same mechanism so a scenario's expected end-state never drifts with the date.
+
+## 2026-10-02 — Toolchain versions (M1)
+- **Node 24.17, pnpm 12.6.** pnpm 12 blocks dependency build scripts by default; allowed ones
+  are listed under `allowBuilds` in `pnpm-workspace.yaml` (esbuild).
+- **TypeScript pinned to 6.0.x, not 7.** TS 7 (native compiler) has no JS API, and
+  typescript-eslint 8.71 needs `typescript >=4.8.4 <6.1`. Type-aware lint rules
+  (`no-floating-promises`, `no-misused-promises`) matter more to us than the faster compiler.
+  Revisit when typescript-eslint supports TS 7.
+- **Python 3.12 for the agent via uv.** The machine has 3.14. Pipecat 1.12.0 needs `>=3.11`
+  with no upper bound, but its native dependencies lag new Python releases; 3.12 is the safe
+  middle. Revisit at M3 when Pipecat is actually installed.
+- **Zod 4.** Built-in `z.toJSONSchema` exports the contracts for Python, so no extra converter.
+- **SQLite via `@libsql/client`, not `better-sqlite3`.** better-sqlite3 13 had no prebuilt
+  binary that installed here, and the source build needs the Windows SDK (not installed).
+  Node 24's built-in `node:sqlite` would be ideal, but Drizzle only supports it in the 1.0
+  betas. libsql ships prebuilt binaries, works with Drizzle 0.45 (`drizzle-orm/libsql`), and
+  supports in-memory databases for tests. Its API is async, which matches Postgres later.
+  Revisit when Drizzle 1.0 is stable (`node:sqlite` driver).
+
+## 2026-10-02 — Schedule times are business-local wall-clock strings
+All schedule times on the wire and in the DB are `YYYY-MM-DDTHH:mm` in the clinic's time zone,
+with no offset. India has no DST, slot maths stays simple, and lexicographic order equals time
+order (SQL `<` and `>` work on TEXT). The zone is in the clinic config. If we ever onboard
+a business in a DST zone, switch storage to UTC instants + zone.
+
+## 2026-10-02 — Vertical-agnostic naming
+Config uses `BusinessConfig`, `resources` (doctors) and `services` (visit types), so another
+vertical needs no schema change. Tool and table names that the spec fixes stay clinic-flavoured
+(`find_patient`, `patients`), because "customer" would only add indirection today.
+
+## 2026-10-02 — One JSON Schema document is the contract with Python
+`packages/shared` exports every tool input/output, the clinic config and the call-log events
+into `packages/shared/json-schema/contracts.json`, with shared types as named `$defs`.
+A Vitest test fails if the file is stale; the agent's Pydantic models are generated from it,
+and a pytest test fails if they are stale. One source of truth, two drift alarms.
+
+## 2026-10-02 — Verification is enforced by the API, not only by the agent
+`find_patient` returns a short-lived `verificationId` only when name + DOB or name + registered
+phone match. Every patient-specific tool requires it, and the API refuses without it. A prompt
+bug in the agent therefore cannot leak appointment details. `find_patient` returns the same
+`not_verified` answer for every failure, so it can't be used to probe whether a name exists.
+
+## 2026-10-27 — Hawk LLM judge is informational, and measured against people
+
+Soft criteria (politeness, language, clarity) are scored by an LLM judge inside Hawk. It never
+changes a verdict; a call it cannot score is reported as unscored, not as a pass. Its trust is the
+agreement % against the labels staff put on calls (`hawk judge-labels`), shown in the report.
+The rubric exempts Myna's opening greeting, which the first smoke run wrongly flagged. See
+`docs/plan-judge.md`.
+
+## 2026-11-05 — One engine, two verticals; LiveKit to be evaluated
+
+Clinic-only reads as built for one employer, and the architecture is already vertical-agnostic, so
+restaurants (reservations, waitlist, "seat available" callback) become a second vertical in the
+same repo. No third vertical. Scope note in CLAUDE.md updated. Separately, a contact suggested
+LiveKit instead of Pipecat: not a migration yet, a one-day spike on telephony and latency, since
+the voice layer is isolated in `services/agent/src/myna_agent/voice/`. Plan and cut points in
+`docs/plan-generalise.md`.
+
+## 2026-11-05 — Restaurant vertical, phase A and B built
+
+Same engine, no fork. What changed: `vertical` and `verification.mode` in the business config;
+restaurant wording as a per-vertical override of the fixed reply lines (`i18n_restaurant.py`,
+selected by a context variable set at each turn); party size mapped to a table size by code
+(`party.py`), where a table "seats" a party by listing the party-size services it can host, so the
+slot engine needed no change; name + phone verification for restaurants (no date of birth, same
+"nothing disclosed before verification" rule); a party no table fits is a handoff
+(`party_too_large`). Allergy and gluten words go through the same redirect as medicines. Found by
+the new tests: "actually we are 4 people" at the name prompt was being stored as the guest's name.
+Hawk: 12 restaurant scenarios (36 calls), a `vertical` field on scenarios, and a "by business"
+cut in the report. Clinic results unchanged (106/106). Waitlist + callback is phase C.
+
+## 2026-11-05 — Waitlist + "a table opened" callback (restaurant phase C)
+
+Hold the freed table as a pending booking rather than inventing a new reservation state: the
+slot engine and the unique-start index already stop anyone else taking it, staff can see and
+approve or reject it on the existing pending queue, and a hold that expires is a plain cancel. The
+callback is the outbound reminder machinery with a `kind`, so claims (no double calls across
+instances), call windows, attempts and do-not-call come for free. Restaurants verify the callee by
+the number we dialled plus the confirmed name, not a date of birth. Outbound window cap moved from
+19:00 to 21:00 for restaurants only (a clinic config above 19:00 is still rejected).
+Bug found on the way: "9:30 pm, 9:30 pm or 9:30 pm" when three tables were free at once; options
+are now distinct times.
+
+## 2026-11-06 — LiveKit spike, part 1 (docs only): keep Pipecat for now
+
+Question: is LiveKit Agents + Sarvam + an Indian SIP trunk a shorter path to a real phone number
+than Pipecat? This part was answered from the docs only. **Nothing was built or measured yet**, so
+there is no latency comparison.
+
+Findings (LiveKit docs, 2026-11-05/06):
+- Sarvam STT plugin exists. Python: `livekit-agents[sarvam]`, `STTRealtime` (realtime API, fixed
+  `saaras:v3-realtime`, needs realtime streaming access on the Sarvam plan) and legacy `STT`
+  (`saaras:v4` or `saaras:v3`, modes incl. `translit` and `codemix`). Node.js has only the legacy
+  `STT` (`saaras:v3`). Defaults differ by SDK, so always set model and language explicitly.
+- Sarvam TTS plugin exists: `bulbul:v3` and `bulbul:v2`, 8 kHz up to 48 kHz, `mulaw`/`alaw`
+  output codecs (useful for telephony). Docs contradict themselves on the Node.js default model.
+- Telephony: official LiveKit quickstart for Plivo (inbound trunk, LiveKit SIP URI as primary
+  URI). For calls to or from India the LiveKit project must be in the India region (stated as a
+  regulatory requirement). Exotel has no official LiveKit quickstart; community reports a 503 from
+  LiveKit's SIP gateway and custom bridges. Twilio's India coverage is disputed (vendor claims).
+- Pipecat already runs our loop with the same Sarvam models, so the models are not the difference.
+  Telephony is.
+
+Decision for now: do not migrate. Telephony via LiveKit + Plivo looks like the shorter path to a
+number, so it stays the candidate for Milestone 5. The swap would be confined to
+`services/agent/src/myna_agent/voice/`.
+
+Still to do before deciding (needs a LiveKit Cloud account in the India region and a Plivo number):
+build the smallest LiveKit agent that talks to our `Brain` over `/v1/calls/*`, then measure
+first-audio latency and barge-in against the Pipecat numbers (493 ms stage sum, about 0.95 s felt).
+Also confirm Pipecat's own Plivo/Exotel serializer support, which was not checked in this part.

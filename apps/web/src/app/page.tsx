@@ -1,0 +1,109 @@
+import Link from 'next/link';
+import { Talk } from '@/components/talk';
+import { Card, HawkLogo, Icon, ICONS, Logo } from '@/components/ui';
+import { demoBusiness, demoKind, publicApi } from '@/lib/api';
+import { VOCAB, type DemoKind } from '@/lib/vocab';
+import type { Demo } from '@/lib/types';
+
+export const dynamic = 'force-dynamic';
+
+export default async function HomePage({
+  searchParams,
+}: {
+  searchParams: Promise<{ biz?: string }>;
+}) {
+  const biz = demoKind((await searchParams).biz);
+  const vocab = VOCAB[biz];
+  const demo = await publicApi<Demo>(`/clinics/${demoBusiness(biz)}/demo`).catch(() => null);
+  return (
+    <>
+      <header className="border-b border-line bg-surface">
+        <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-4 px-4 py-4 sm:px-8">
+          <Logo />
+          <div className="mr-auto leading-tight">
+            <p className="font-bold">myna</p>
+            <p className="text-xs text-ink-3">Myna talks, Hawk watches.</p>
+          </div>
+          <nav aria-label="Main" className="flex items-center gap-1 text-sm font-semibold">
+            <Link
+              href="/hawk"
+              className="flex h-11 items-center gap-2 rounded-lg px-3 text-ink-2 hover:bg-sunken"
+            >
+              <HawkLogo size={20} />
+              How Hawk tests Myna
+            </Link>
+            <Link
+              href="/login"
+              className="flex h-11 items-center rounded-lg px-3 text-primary-ink hover:bg-sunken"
+            >
+              Staff sign in
+            </Link>
+          </nav>
+        </div>
+      </header>
+
+      <main className="mx-auto flex max-w-6xl min-w-0 flex-col gap-10 px-4 py-8 sm:px-8">
+        <nav aria-label="Demo business" className="flex flex-wrap items-center gap-2 text-sm">
+          <span className="text-ink-3">Try Myna as:</span>
+          {(Object.keys(VOCAB) as DemoKind[]).map((k) => (
+            <Link
+              key={k}
+              href={k === 'clinic' ? '/' : `/?biz=${k}`}
+              aria-current={k === biz ? 'page' : undefined}
+              className={`flex min-h-11 items-center rounded-full border px-4 font-semibold ${
+                k === biz
+                  ? 'border-primary bg-primary text-on-primary'
+                  : 'border-line-strong bg-surface text-ink-2 hover:bg-sunken'
+              }`}
+            >
+              {VOCAB[k].tab}
+            </Link>
+          ))}
+        </nav>
+
+        <Talk key={biz} initialDemo={demo} biz={biz} />
+
+        <div className="grid gap-4 md:grid-cols-3">
+          <Card className="flex flex-col gap-2">
+            <h2 className="flex items-center gap-2 font-bold text-safe-ink">
+              <Icon d={ICONS.check} size={18} /> She can
+            </h2>
+            <ul className="list-disc space-y-1 pl-5 text-ink-2">
+              {vocab.can.map((t) => (
+                <li key={t}>{t}</li>
+              ))}
+            </ul>
+          </Card>
+          <Card className="flex flex-col gap-2">
+            <h2 className="flex items-center gap-2 font-bold text-danger-ink">
+              <Icon d={ICONS.x} size={18} /> She won’t
+            </h2>
+            <ul className="list-disc space-y-1 pl-5 text-ink-2">
+              {vocab.wont.map((t) => (
+                <li key={t}>{t}</li>
+              ))}
+            </ul>
+          </Card>
+          <div className="flex flex-col gap-2 rounded-[20px] bg-danger-soft p-5 text-danger-ink">
+            <h2 className="flex items-center gap-2 font-bold">
+              <Icon d={ICONS.warn} size={18} /> Emergency? Call 112 or 108
+            </h2>
+            <p className="text-ink">
+              If a caller mentions chest pain, heavy bleeding, trouble breathing or anything urgent,
+              Myna stops and tells them to call 112 or 108 right away, in their language.
+            </p>
+            <p lang="hi" className="text-ink">
+              आपातकाल में तुरंत 112 या 108 पर कॉल करें।
+            </p>
+          </div>
+        </div>
+
+        <p className="max-w-3xl text-[13px] text-ink-3">
+          Myna says she’s an AI assistant at the start of every call. This demo doesn’t record
+          audio. Chats are kept for 30 days with phone numbers masked, then deleted; ask us and
+          we’ll delete yours sooner. {vocab.disclaimer}
+        </p>
+      </main>
+    </>
+  );
+}

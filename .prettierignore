@@ -1,0 +1,10 @@
+pnpm-lock.yaml
+node_modules
+dist
+coverage
+services/agent
+packages/shared/json-schema
+*.md
+docs/reports
+.next
+services/api/migrations
