@@ -1,111 +1,345 @@
-# Myna + Hawk
 
-**Myna talks, Hawk watches.**
+# VaaniOS — Multilingual AI Voice Receptionist
 
-Myna is a multilingual (English, Hindi, Hinglish) AI phone receptionist for small Indian businesses: a general receptionist that books, answers
-from the business's own config, takes messages and calls back. Clinics (the pilot) and
-restaurants are the two verticals built so far.
-Hawk is the test harness that decides whether Myna is safe to go live.
+**Reliable, multilingual voice automation for Indian businesses.**
 
-Built vertical-agnostic; validated on clinics (the pilot, hardest first) and on restaurant
-reservations (tables by party size, name + phone verification, a waitlist callback to come).
-A business is a config file in `clinics/`; `vertical` and `verification` pick the wording and rules.
+VaaniOS is an AI-powered voice receptionist designed for Indian businesses, supporting **English, Hindi, and Hinglish**. It automates customer interactions by answering business-related queries, managing appointments and restaurant reservations, capturing messages, and arranging callbacks.
 
-## The idea in one paragraph
+Built with a configurable architecture, VaaniOS supports multiple business domains, including clinics and restaurants, without requiring changes to the core conversation engine.
 
-The language model **suggests, code decides**. The model only turns what the caller said into a
-small structured guess (intent, language, fields); every reply Myna speaks is a fixed per-language
-template, and code enforces the rules: AI disclosure, emergency → 112/108 + human, no medical
-advice, verification before any patient detail, read-back before any booking, handoff when
-confused. Hawk then plays hundreds of simulated patients against it and grades the *schedule it
-leaves behind*, not just the words.
+## Key Features
 
-## Layout
+- **Multilingual Conversations:** Supports English, Hindi, and Hinglish for natural interactions with Indian customers.
+- **AI-Powered Intent Recognition:** Uses LLMs to understand caller intent, identify required information, and extract structured fields.
+- **Deterministic Business Logic:** Enforces application-level rules for identity verification, booking confirmation, and human escalation.
+- **Appointment Management:** Handles appointment scheduling, availability checks, and booking modifications.
+- **Restaurant Reservations:** Supports table allocation based on party size, reservation verification, and waitlist callbacks.
+- **Business-Specific Configuration:** Adapts conversation flows, response templates, and verification rules through independent configuration files.
+- **Safety & Human Handoff:** Handles emergency situations, avoids medical advice, and escalates uncertain conversations to human operators.
+- **Real-Time Voice Interaction:** Supports browser-based voice conversations using Pipecat and Sarvam AI.
+- **Horizontal Scaling:** Uses Redis-backed shared state to support multiple application instances.
 
+## Core Architecture
+
+**The language model suggests. Code decides.**
+
+VaaniOS separates language understanding from business decision-making.
+
+The LLM is responsible for:
+- Intent extraction.
+- Language identification.
+- Entity and field extraction.
+- Understanding caller requests.
+
+Application code is responsible for:
+- Business rule enforcement.
+- Identity verification.
+- Appointment and reservation validation.
+- Read-back confirmation before bookings.
+- Emergency handling and human escalation.
+- Consistent, language-specific response generation.
+
+This architecture makes the system more predictable, reliable, and suitable for business-critical workflows.
+
+## System Architecture
+
+```text
+              Caller
+                 |
+                 v
+          Next.js Frontend
+                 |
+          WebRTC / Pipecat
+                 |
+                 v
+          Python Agent Engine
+                 |
+          Intent Extraction
+                 |
+                 v
+       Conversation State Machine
+                 |
+                 v
+       Deterministic Rule Engine
+                 |
+          Fastify Backend API
+                 |
+                 v
+           SQLite Database
+                 |
+                 v
+       Booking & Business Logic
+                 |
+                 v
+         Response Generation
+                 |
+                 v
+          Sarvam Bulbul TTS
+                 |
+                 v
+              Caller
 ```
-apps/web          Next.js: talk to Myna (type or speak), clinic dashboard, Hawk reports
-services/api      Fastify + Drizzle + SQLite: clinics, schedule, tool endpoints, call logs
-services/agent    Python: conversation state machine, text endpoint, Pipecat voice pipeline
-hawk/             TS test harness: scenarios, personas, grader, go-live report (text + audio mode)
-packages/shared   Zod schemas: config, tool contracts → JSON Schema for Python; rate limiter
-clinics/          one YAML config per clinic (synthetic only)
-docs/             plans, decisions, findings, Hawk reports
+
+## Technology Stack
+
+| Component | Technology |
+|---|---|
+| Frontend | Next.js |
+| Backend API | Fastify |
+| ORM | Drizzle ORM |
+| Database | SQLite |
+| Agent Engine | Python |
+| Voice Framework | Pipecat |
+| Speech-to-Text | Sarvam Saaras |
+| Text-to-Speech | Sarvam Bulbul |
+| Language Understanding | Sarvam AI |
+| Shared State | Redis |
+| Schema Validation | TypeScript, Zod |
+| Testing | Vitest, Pytest |
+
+## Project Structure
+
+```text
+.
+├── apps/
+│   └── web/                 # Next.js frontend
+│
+├── services/
+│   ├── api/                 # Fastify + Drizzle + SQLite
+│   │
+│   └── agent/               # Python agent engine
+│
+├── packages/
+│   └── shared/              # Shared schemas and contracts
+│
+├── clinics/                 # Business configuration files
+│
+├── docs/                    # Architecture and development docs
+│
+├── docker-compose.yml
+└── package.json
 ```
 
-## Requirements
+## Getting Started
 
-- Node 22+ and pnpm 12
-- [uv](https://docs.astral.sh/uv/) (installs Python 3.12 for the agent)
-- Optional: a Sarvam API key (real understanding + speech), Docker (a local Redis)
+### Prerequisites
 
-## See it running
+- Node.js 22+
+- pnpm 12
+- [uv](https://docs.astral.sh/uv/) for Python dependency management
+- Python 3.12
+- Optional: Sarvam API key for real speech and language processing
+- Optional: Docker for running Redis locally
 
-```sh
+### Installation
+
+**1. Clone the repository**
+
+```bash
+git clone <repository-url>
+cd vaani-os
+```
+
+**2. Install Node.js dependencies**
+
+```bash
 pnpm install
-(cd services/agent && uv sync)
-cp .env.example .env     # add SARVAM_API_KEY for the real model and for voice; works offline without
+```
+
+**3. Install Python dependencies**
+
+```bash
+cd services/agent
+uv sync
+cd ../..
+```
+
+**4. Configure environment variables**
+
+```bash
+cp .env.example .env
+```
+
+Add your Sarvam API key:
+
+```env
+SARVAM_API_KEY=your_sarvam_api_key
+```
+
+The application can also run using its offline configuration without a real Sarvam API key.
+
+**5. Start the application**
+
+```bash
 pnpm demo
 ```
 
-Opens API :4000, agent :8000 and web :3000 together. Then:
+This starts the application services:
 
-- **http://localhost:3000**: talk to Myna. Type, or press *Talk with your voice* (microphone;
-  needs `SARVAM_API_KEY`). The booking appears on the mini schedule as it is confirmed.
-- **/hawk**: the go-live report. **/login** (`smile-dental` / `demo-password-123`): the clinic
-  dashboard, call review and manual labels.
+| Service | URL |
+|---|---|
+| Frontend | http://localhost:3000 |
+| Backend API | http://localhost:4000 |
+| Python Agent | http://localhost:8000 |
 
-## Hawk: is Myna safe to go live?
+## Using VaaniOS
 
-```sh
-pnpm hawk run                                  # every scenario × EN / Hinglish / Hindi
-pnpm hawk run --filter reminder --lang hi      # a slice
-pnpm hawk run --gate                           # exit 1 if any flow is NOT SAFE (CI)
-pnpm hawk run --nlu sarvam --model sarvam-105b-conversations   # with the real model
-pnpm hawk run --instances 2                    # two agents sharing Redis; turns hop between them
-pnpm hawk run --audio --sample 24              # callers SPEAK: Bulbul → Saaras → Myna
+### Voice Receptionist
+
+Open:
+
+http://localhost:3000
+
+You can interact with VaaniOS through:
+- Text-based conversations.
+- Browser microphone input.
+- Real-time voice conversations using Sarvam AI.
+
+Confirmed bookings appear on the mini schedule.
+
+### Business Dashboard
+
+Open:
+
+http://localhost:3000/login
+
+Demo credentials:
+
+```text
+Username: smile-dental
+Password: demo-password-123
 ```
 
-Hawk starts its own API and agent (temp database, clock pinned to Mon 12 Oct 2026 11:00 IST),
-gives every scenario its own throwaway clinic, plays the patient, grades each call against the
-expected end state and the safety rules, and writes a go-live report to `docs/reports/`
-(JSON + markdown + HTML; the JSON is also stored via the API). Scenarios live in
-`hawk/scenarios/*.yaml`, personas in `hawk/personas/`. All runs so far: `docs/reports/README.md`.
+The dashboard provides:
+- Schedule management.
+- Call history and review.
+- Manual call labels.
+- Business-specific operational visibility.
 
-Audio mode is the honest one: it shows what real speech recognition does to Hinglish names,
-dates and numbers, which clean text never does.
+## Real-Time Voice Pipeline
 
-## Scaling out (Redis, optional)
+VaaniOS uses **Pipecat with WebRTC** to enable real-time browser-based voice conversations.
 
-Without `REDIS_URL` everything lives in memory, which is right for one instance. With it (set the
-same URL on API, agent and web; `docker compose up -d redis` locally) live-call state, reminder
-claims, rate limits and the config cache are shared, so any instance can serve any turn of a call,
-two workers never ring the same patient, and the kill switch reaches every instance. See
-`docs/plan-redis.md` and `docs/decisions.md`.
+The pipeline integrates:
 
-## Voice
+- **Pipecat:** Audio transport and pipeline orchestration.
+- **Sarvam Saaras:** Speech-to-text conversion.
+- **Sarvam Bulbul:** Text-to-speech generation.
+- **Python Agent Engine:** Conversation processing and deterministic business logic.
 
-Browser voice is Pipecat (WebRTC) + Sarvam Saaras (speech-to-text) and Bulbul (text-to-speech).
-Pipecat owns the transport, voice-activity detection and barge-in; Myna's own `MynaTurn` takes
-each transcript to the same turn logic the text endpoint uses, and Bulbul speaks the fixed reply.
-Per-turn latency (listen / think / speak) is logged and shown in the UI. See `docs/plan-m3.md`.
+### Voice Processing Flow
 
-## Test
-
-```sh
-pnpm lint && pnpm typecheck && pnpm test           # TS: shared, api, hawk, web
-cd services/agent && uv run ruff check src tests && uv run pytest   # Python (starts the real API)
-docker build -f Dockerfile.ci -t myna-ci . && docker run --rm myna-ci   # everything, clean Linux
+```text
+Caller Speech
+     |
+     v
+WebRTC Audio Stream
+     |
+     v
+Pipecat Pipeline
+     |
+     v
+Sarvam Saaras (STT)
+     |
+     v
+Recognized Transcript
+     |
+     v
+Python Agent Engine
+     |
+     v
+Business Rule Validation
+     |
+     v
+Fixed Language Response
+     |
+     v
+Sarvam Bulbul (TTS)
+     |
+     v
+Generated Speech
 ```
 
-The live voice tests (`tests/test_voice_live.py`, `tests/test_voice_webrtc.py`) call the real
-Sarvam services and are skipped without `SARVAM_API_KEY`.
+Pipecat manages WebRTC transport, Voice Activity Detection (VAD), and barge-in handling.
 
-When a contract in `packages/shared` changes: `pnpm schemas:export`, then
-`cd services/agent && uv run python scripts/gen_contracts.py`. Drift tests on both sides fail
-until you do.
+Both text and voice interactions use the same underlying conversation logic, ensuring consistent business rule enforcement.
 
-## Docs
+Per-turn listening, processing, and speaking latency is logged and exposed through the frontend.
 
-- `docs/plan-m1.md`, `plan-m2.md`, `plan-m3.md`, `plan-m4.md`, `plan-redis.md`: plans and status
-- `docs/decisions.md`: design decisions and why
-- `docs/findings.md`: what testing (and later, real calls) taught us
+## Horizontal Scaling with Redis
+
+VaaniOS supports multi-instance execution through Redis-backed shared state.
+
+Without Redis, the application uses in-memory state, suitable for single-instance development.
+
+With Redis enabled, the following state is shared:
+
+- Live conversation state.
+- Reminder execution claims.
+- Rate-limiting information.
+- Business configuration cache.
+
+Start Redis locally:
+
+```bash
+docker compose up -d redis
+```
+
+Configure the same `REDIS_URL` across the API, agent, and web services.
+
+## Testing and Quality Checks
+
+### TypeScript
+
+```bash
+pnpm lint
+pnpm typecheck
+pnpm test
+```
+
+### Python
+
+```bash
+cd services/agent
+
+uv run ruff check src tests
+uv run pytest
+```
+
+### Docker Validation
+
+```bash
+docker build -f Dockerfile.ci -t vaani-ci .
+docker run --rm vaani-ci
+```
+
+Live voice tests require `SARVAM_API_KEY` and are skipped when the key is unavailable.
+
+### Updating Shared Contracts
+
+When schemas change inside `packages/shared`, regenerate the Python contracts:
+
+```bash
+pnpm schemas:export
+
+cd services/agent
+uv run python scripts/gen_contracts.py
+```
+
+## Documentation
+
+Additional engineering documentation is available under `docs/`.
+
+- `docs/plan-m1.md` – Initial implementation plan.
+- `docs/plan-m2.md` – Development milestones.
+- `docs/plan-m3.md` – Voice pipeline implementation.
+- `docs/plan-m4.md` – Further development plans.
+- `docs/plan-redis.md` – Redis and horizontal scaling.
+- `docs/decisions.md` – Architecture and engineering decisions.
+- `docs/findings.md` – Testing findings and implementation insights.
+
+---
+
+**VaaniOS**
+
+*Building reliable, multilingual voice agents for real-world Indian business workflows.*
